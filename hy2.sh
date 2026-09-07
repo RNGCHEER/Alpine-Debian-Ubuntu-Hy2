@@ -201,18 +201,79 @@ get_sni_domain() {
         1)
             echo ""
             echo "  推荐域名 (用于SNI伪装):"
-            echo "    1) bing.com"
-            echo "    2) cloudflare.com"
-            echo "    3) microsoft.com"
-            echo "    4) 自定义域名"
+            echo "    ---- 科技巨头 ----"
+            echo "    1) bing.com               (微软必应)"
+            echo "    2) microsoft.com          (微软官网)"
+            echo "    3) windows.com            (Windows)"
+            echo "    4) outlook.com            (Outlook邮箱)"
+            echo "    5) cloudflare.com         (Cloudflare)"
+            echo "    6) apple.com              (苹果官网)"
+            echo "    7) google.com             (谷歌)"
+            echo "    8) github.com             (GitHub)"
+            echo "    ---- CDN/云服务 ----"
+            echo "    9) amazon.com             (亚马逊)"
+            echo "   10) aws.amazon.com         (AWS)"
+            echo "   11) azure.com              (Azure)"
+            echo "   12) fastly.com             (Fastly CDN)"
+            echo "   13) akamai.com             (Akamai)"
+            echo "   14) edgekey.net            (Akamai Edge)"
+            echo "   ---- 媒体/社交 ----"
+            echo "   15) twitter.com            (推特)"
+            echo "   16) x.com                  (X/Twitter)"
+            echo "   17) youtube.com            (YouTube)"
+            echo "   18) facebook.com           (Facebook)"
+            echo "   19) instagram.com          (Instagram)"
+            echo "   20) tiktok.com             (TikTok)"
+            echo "   ---- 中国网站 ----"
+            echo "   21) qq.com                 (腾讯QQ)"
+            echo "   22) taobao.com             (淘宝)"
+            echo "   23) baidu.com              (百度)"
+            echo "   24) weibo.com              (微博)"
+            echo "   25) jd.com                 (京东)"
+            echo "   26) 163.com                (网易)"
+            echo "   ---- 其他 ----"
+            echo "   27) zoom.us                (Zoom)"
+            echo "   28) teams.microsoft.com    (Teams)"
+            echo "   29) linkedin.com           (LinkedIn)"
+            echo "   30) shopify.com            (Shopify)"
+            echo "   31) netflix.com            (Netflix)"
+            echo "   32) 自定义域名"
             echo ""
-            read -rp "请选择域名 [1-4，默认1]: " domain_choice
+            read -rp "请选择域名 [1-32，默认1]: " domain_choice
             domain_choice=${domain_choice:-1}
             case "$domain_choice" in
-                1) SNI_DOMAIN="bing.com" ;;
-                2) SNI_DOMAIN="cloudflare.com" ;;
-                3) SNI_DOMAIN="microsoft.com" ;;
-                4)
+                1)  SNI_DOMAIN="bing.com" ;;
+                2)  SNI_DOMAIN="microsoft.com" ;;
+                3)  SNI_DOMAIN="windows.com" ;;
+                4)  SNI_DOMAIN="outlook.com" ;;
+                5)  SNI_DOMAIN="cloudflare.com" ;;
+                6)  SNI_DOMAIN="apple.com" ;;
+                7)  SNI_DOMAIN="google.com" ;;
+                8)  SNI_DOMAIN="github.com" ;;
+                9)  SNI_DOMAIN="amazon.com" ;;
+                10) SNI_DOMAIN="aws.amazon.com" ;;
+                11) SNI_DOMAIN="azure.com" ;;
+                12) SNI_DOMAIN="fastly.com" ;;
+                13) SNI_DOMAIN="akamai.com" ;;
+                14) SNI_DOMAIN="edgekey.net" ;;
+                15) SNI_DOMAIN="twitter.com" ;;
+                16) SNI_DOMAIN="x.com" ;;
+                17) SNI_DOMAIN="youtube.com" ;;
+                18) SNI_DOMAIN="facebook.com" ;;
+                19) SNI_DOMAIN="instagram.com" ;;
+                20) SNI_DOMAIN="tiktok.com" ;;
+                21) SNI_DOMAIN="qq.com" ;;
+                22) SNI_DOMAIN="taobao.com" ;;
+                23) SNI_DOMAIN="baidu.com" ;;
+                24) SNI_DOMAIN="weibo.com" ;;
+                25) SNI_DOMAIN="jd.com" ;;
+                26) SNI_DOMAIN="163.com" ;;
+                27) SNI_DOMAIN="zoom.us" ;;
+                28) SNI_DOMAIN="teams.microsoft.com" ;;
+                29) SNI_DOMAIN="linkedin.com" ;;
+                30) SNI_DOMAIN="shopify.com" ;;
+                31) SNI_DOMAIN="netflix.com" ;;
+                32)
                     read -rp "请输入自定义域名: " SNI_DOMAIN
                     if [[ -z "$SNI_DOMAIN" ]]; then
                         SNI_DOMAIN="bing.com"
