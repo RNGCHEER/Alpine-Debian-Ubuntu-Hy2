@@ -388,26 +388,37 @@ install_hy2() {
 
 # 手动下载安装 (所有系统通用)
 _install_hy2_manual() {
-    # 获取最新版本号 (不依赖 grep -P)
-    local ver
-    ver=$(curl -fsSL "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
-        | grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//')
-    if [[ -z "$ver" ]]; then
-        ver="2.6.2"
-        warn "无法获取最新版本，使用默认: v${ver}"
+    # 先设默认版本，再尝试获取最新
+    local ver="2.6.2"
+    local api_result
+    api_result=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+        "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null || echo "")
+    if [[ -n "$api_result" ]]; then
+        local detected
+        detected=$(echo "$api_result" | grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//')
+        if [[ -n "$detected" ]]; then
+            ver="$detected"
+        else
+            warn "无法解析版本号，使用默认: v${ver}"
+        fi
+    else
+        warn "无法访问 GitHub API，使用默认: v${ver}"
     fi
 
     local bin_url="https://github.com/apernet/hysteria/releases/download/v${ver}/hysteria-linux-${HY2_ARCH}"
     info "下载 Hysteria2 v${ver} (${HY2_ARCH})..."
+    tip "URL: ${bin_url}"
 
-    if ! wget -q -O /usr/local/bin/hysteria "$bin_url" 2>/dev/null; then
-        # wget 可能因重定向失败，尝试 curl
-        if ! curl -fsSL -o /usr/local/bin/hysteria "$bin_url" 2>/dev/null; then
-            err "下载失败，请检查网络: ${bin_url}"
-            exit 1
-        fi
+    # GitHub releases 需要 -L 跟随重定向
+    if curl -fSL --connect-timeout 15 --max-time 120 -o /usr/local/bin/hysteria "$bin_url" 2>/dev/null; then
+        chmod +x /usr/local/bin/hysteria
+    elif wget --timeout=60 -q -O /usr/local/bin/hysteria "$bin_url" 2>/dev/null; then
+        chmod +x /usr/local/bin/hysteria
+    else
+        err "下载失败，请检查网络或手动下载:"
+        tip "wget -O /usr/local/bin/hysteria '${bin_url}'"
+        exit 1
     fi
-    chmod +x /usr/local/bin/hysteria
 
     if ! command -v hysteria &>/dev/null; then
         err "Hysteria2 安装失败"
