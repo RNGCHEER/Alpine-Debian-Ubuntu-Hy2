@@ -6,13 +6,13 @@
 ## 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/Alpine-Debian-Ubuntu-Hy2/main/hy2.sh) install
+bash <(curl -fsSL https://raw.githubusercontent.com/RNGCHEER/Alpine-Debian-Ubuntu-Hy2/main/hy2.sh) install
 ```
 
 或交互菜单：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/Alpine-Debian-Ubuntu-Hy2/main/hy2.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/RNGCHEER/Alpine-Debian-Ubuntu-Hy2/main/hy2.sh)
 ```
 
 ## ✨ 功能
