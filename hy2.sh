@@ -369,25 +369,61 @@ install_hy2() {
         fi
     fi
 
-    # 使用官方安装脚本
-    bash <(curl -fsSL "https://get.hy2.sh/") 2>&1
-
-    if command -v hysteria &>/dev/null; then
-        info "Hysteria2 安装成功"
+    if [[ "$OS" == "alpine" ]]; then
+        # ---- Alpine: 手动下载，不走官方脚本 (BusyBox grep/useradd 不兼容) ----
+        info "Alpine 系统，使用手动安装..."
+        _install_hy2_manual
     else
-        # 手动下载 fallback
-        warn "官方脚本安装失败，尝试手动下载..."
-        local ver
-        ver=$(curl -fsSL "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//' || echo "2.6.1")
-        local url="https://github.com/apernet/hysteria/releases/download/v${ver}/hysteria-linux-${HY2_ARCH}"
-        wget -O /usr/local/bin/hysteria "$url" && chmod +x /usr/local/bin/hysteria
-        if ! command -v hysteria &>/dev/null; then
-            err "Hysteria2 安装失败"
+        # ---- Debian/Ubuntu: 优先官方脚本 ----
+        bash <(curl -fsSL "https://get.hy2.sh/") 2>&1
+
+        if command -v hysteria &>/dev/null; then
+            info "Hysteria2 安装成功"
+        else
+            warn "官方脚本安装失败，尝试手动下载..."
+            _install_hy2_manual
+        fi
+    fi
+}
+
+# 手动下载安装 (所有系统通用)
+_install_hy2_manual() {
+    # 获取最新版本号 (不依赖 grep -P)
+    local ver
+    ver=$(curl -fsSL "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//')
+    if [[ -z "$ver" ]]; then
+        ver="2.6.2"
+        warn "无法获取最新版本，使用默认: v${ver}"
+    fi
+
+    local bin_url="https://github.com/apernet/hysteria/releases/download/v${ver}/hysteria-linux-${HY2_ARCH}"
+    info "下载 Hysteria2 v${ver} (${HY2_ARCH})..."
+
+    if ! wget -q -O /usr/local/bin/hysteria "$bin_url" 2>/dev/null; then
+        # wget 可能因重定向失败，尝试 curl
+        if ! curl -fsSL -o /usr/local/bin/hysteria "$bin_url" 2>/dev/null; then
+            err "下载失败，请检查网络: ${bin_url}"
             exit 1
         fi
-        info "Hysteria2 v${ver} 手动安装成功"
     fi
+    chmod +x /usr/local/bin/hysteria
+
+    if ! command -v hysteria &>/dev/null; then
+        err "Hysteria2 安装失败"
+        exit 1
+    fi
+
+    # 创建 hysteria 用户 (Alpine 用 adduser，Debian/Ubuntu 用 useradd)
+    if ! id hysteria &>/dev/null 2>&1; then
+        if command -v adduser &>/dev/null && [[ "$OS" == "alpine" ]]; then
+            adduser -S -s /sbin/nologin hysteria 2>/dev/null || true
+        elif command -v useradd &>/dev/null; then
+            useradd -r -s /sbin/nologin hysteria 2>/dev/null || true
+        fi
+    fi
+
+    info "Hysteria2 v${ver} 手动安装成功"
 }
 
 # --------------- 写配置文件 ---------------
