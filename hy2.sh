@@ -341,6 +341,23 @@ gen_password() {
     info "生成随机密码: ${HY2_PASSWORD}"
 }
 
+# --------------- 节点命名 ---------------
+get_node_name() {
+    echo ""
+    echo "=========================================="
+    echo " 🏷️  节点命名"
+    echo "=========================================="
+    echo ""
+    tip "为你的 Hysteria2 节点设置一个名称"
+    tip "该名称将显示在客户端的节点列表中"
+    echo ""
+    tip "示例: 香港-01, 日本节点, 自建-IEPL, 东京BGP..."
+    echo ""
+    read -rp "请输入节点名称 (回车使用默认名称): " NODE_NAME
+    NODE_NAME=${NODE_NAME:-"Hysteria2-节点"}
+    info "节点名称: ${NODE_NAME}"
+}
+
 # --------------- 安装依赖 ---------------
 install_deps() {
     local extra="${1:-}"
@@ -535,20 +552,29 @@ generate_link() {
     local sni="$SNI_DOMAIN"
     local insecure_flag="1"
 
+    # 根据 IP 情况决定链接中的节点名称
+    local link_name_v4="${NODE_NAME}"
+    local link_name_v6="${NODE_NAME}"
+    if [[ -n "${SERVER_IP4:-}" ]] && [[ -n "${SERVER_IP6:-}" ]]; then
+        link_name_v4="${NODE_NAME}-IPv4"
+        link_name_v6="${NODE_NAME}-IPv6"
+    fi
+
     if [[ -n "${SERVER_IP4:-}" ]]; then
-        local link4="hysteria2://${pwd}@${SERVER_IP4}:${port}?sni=${sni}&insecure=${insecure_flag}#HY2-IPv4"
+        local link4="hysteria2://${pwd}@${SERVER_IP4}:${port}?sni=${sni}&insecure=${insecure_flag}#${link_name_v4}"
         tip "IPv4 链接: ${link4}"
         echo ""
     fi
 
     if [[ -n "${SERVER_IP6:-}" ]]; then
-        local link6="hysteria2://${pwd}@[${SERVER_IP6}]:${port}?sni=${sni}&insecure=${insecure_flag}#HY2-IPv6"
+        local link6="hysteria2://${pwd}@[${SERVER_IP6}]:${port}?sni=${sni}&insecure=${insecure_flag}#${link_name_v6}"
         tip "IPv6 链接: ${link6}"
         echo ""
     fi
 
     # 通用配置信息
     echo "------------ 客户端配置信息 ------------"
+    tip "🏷️  节点名称: ${NODE_NAME}"
     tip "地址:     ${SERVER_IP4:-${SERVER_IP6}}"
     tip "端口:     ${port}"
     tip "密码:     ${pwd}"
@@ -576,6 +602,7 @@ do_install() {
     install_deps
     get_ip
     get_port
+    get_node_name
     get_sni_domain
     gen_password
     install_hy2
@@ -600,6 +627,7 @@ HY2_PASSWORD=${HY2_PASSWORD}
 SNI_DOMAIN=${SNI_DOMAIN}
 CERT_PATH=${CERT_PATH}
 KEY_PATH=${KEY_PATH}
+NODE_NAME=${NODE_NAME}
 EOF
 
     info "安装信息已保存至: /etc/hysteria/.install_info"
@@ -663,6 +691,7 @@ do_status() {
         echo ""
         echo "------------ 安装信息 ------------"
         source /etc/hysteria/.install_info
+        echo "  🏷️  节点名称: ${NODE_NAME:-未设置}"
         echo "  IPv4:   ${SERVER_IP4:-无}"
         echo "  IPv6:   ${SERVER_IP6:-无}"
         echo "  端口:   ${SERVER_PORT}"
@@ -673,9 +702,10 @@ do_status() {
         local sni="$SNI_DOMAIN"
         local pwd="$HY2_PASSWORD"
         local port="$SERVER_PORT"
+        local display_name="${NODE_NAME:-Hysteria2-节点}"
         echo ""
-        [[ -n "${SERVER_IP4:-}" ]] && tip "IPv4 链接: hysteria2://${pwd}@${SERVER_IP4}:${port}?sni=${sni}&insecure=1#HY2-IPv4"
-        [[ -n "${SERVER_IP6:-}" ]] && tip "IPv6 链接: hysteria2://${pwd}@[${SERVER_IP6}]:${port}?sni=${sni}&insecure=1#HY2-IPv6"
+        [[ -n "${SERVER_IP4:-}" ]] && tip "IPv4 链接: hysteria2://${pwd}@${SERVER_IP4}:${port}?sni=${sni}&insecure=1#${display_name}"
+        [[ -n "${SERVER_IP6:-}" ]] && tip "IPv6 链接: hysteria2://${pwd}@[${SERVER_IP6}]:${port}?sni=${sni}&insecure=1#${display_name}"
         echo ""
     fi
 }
