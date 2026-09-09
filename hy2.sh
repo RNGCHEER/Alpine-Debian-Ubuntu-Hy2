@@ -406,17 +406,20 @@ install_hy2() {
 # 手动下载安装 (所有系统通用)
 _install_hy2_manual() {
     # 版本号：默认值先写死，API 获取失败时直接用
-    HY2_VER="2.6.2"
+    HY2_VER="2.12.2"
+    HY2_TAG="app/v${HY2_VER}"
     api_result=$(curl -fsSL --connect-timeout 10 --max-time 20 \
         "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null) || true
     if [ -n "$api_result" ]; then
-        detected=$(echo "$api_result" | grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//') || true
-        if [ -n "$detected" ]; then
-            HY2_VER="$detected"
+        # 提取完整 tag_name (如 app/v2.12.2)，保留 app/ 前缀
+        detected_tag=$(echo "$api_result" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"//;s/".*//') || true
+        if [ -n "$detected_tag" ]; then
+            HY2_TAG="$detected_tag"
+            HY2_VER="${detected_tag#*/}"
         fi
     fi
 
-    bin_url="https://github.com/apernet/hysteria/releases/download/v${HY2_VER}/hysteria-linux-${HY2_ARCH}"
+    bin_url="https://github.com/apernet/hysteria/releases/download/${HY2_TAG}/hysteria-linux-${HY2_ARCH}"
     info "下载 Hysteria2 v${HY2_VER} (${HY2_ARCH})..."
     tip "URL: ${bin_url}"
 
