@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================
-# Hysteria2 一键安装管理脚本
+# Hysteria2 一键安装管理脚本   (版本 V0.3)
 # 支持: Alpine / Debian / Ubuntu
 # 架构: x86_64 / aarch64 / armv7
-# 功能: 输入IP、选择端口、自签SNI证书、安装/卸载/管理
+# 功能: 输入IP、选择端口、自签/克隆 SNI 证书、安装/卸载/管理
+#       证书伪装: 输入域名 -> 提取目标站点真实证书 -> 克隆主体/签发者/SAN 伪装成该域名
+#       版本更新检查: 一键检查脚本 / Hysteria2 版本并在线升级 (支持国内镜像加速)
 #       安装完成后可直接输入 hy2 呼出管理菜单
-#       (查看节点信息 / 修改节点配置 / 重启 / 日志 / 卸载)
+#       (查看节点信息 / 修改节点配置 / 重启 / 日志 / 检查更新 / 卸载)
 # ============================================================
 
 set -euo pipefail
@@ -19,6 +21,10 @@ HY2_LOG="/var/log/hysteria2.log"
 HY2_SCRIPT_URL="https://raw.githubusercontent.com/RNGCHEER/Alpine-Debian-Ubuntu-Hy2/main/hy2.sh"
 HY2_LOCAL_SCRIPT="/usr/local/lib/hy2/hy2.sh"
 HY2_CMD="/usr/local/bin/hy2"
+# 脚本版本号 (版本更新检查时与 GitHub 上的脚本对比)
+SCRIPT_VERSION="0.3"
+# 国内网络兜底: GitHub 加速镜像前缀 (按顺序尝试)
+HY2_MIRRORS="https://gh-proxy.com/ https://ghfast.top/ https://github.moeyy.cn/"
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -40,6 +46,7 @@ KEY_PATH=""
 NODE_NAME=""
 MASQUERADE_URL=""
 PIN_SHA256=""
+CERT_MODE=""   # self=自签 clone=克隆伪装 custom=自有证书
 
 # --------------- 工具函数 ---------------
 info()  { echo -e "${GREEN}[✔]${NC} $*"; }
@@ -127,6 +134,7 @@ service_active() {
 load_install_info() {
     SERVER_IP4=""; SERVER_IP6=""; SERVER_PORT=""; HY2_PASSWORD=""
     SNI_DOMAIN=""; CERT_PATH=""; KEY_PATH=""; NODE_NAME=""; MASQUERADE_URL=""
+    CERT_MODE=""
 
     if [[ -f "$HY2_INFO_FILE" ]]; then
         set +u
@@ -199,6 +207,7 @@ CERT_PATH=${CERT_PATH:-}
 KEY_PATH=${KEY_PATH:-}
 NODE_NAME=${NODE_NAME:-Hysteria2-节点}
 MASQUERADE_URL=${MASQUERADE_URL:-https://${SNI_DOMAIN:-bing.com}}
+CERT_MODE=${CERT_MODE:-}
 EOF
     chmod 600 "$HY2_INFO_FILE" 2>/dev/null || true
 }
@@ -445,12 +454,228 @@ generate_self_signed_cert() {
     info "自签证书已生成: ${CERT_PATH}"
     info "自签密钥已生成: ${KEY_PATH}"
 
-    # 计算 pinSHA256
-    PIN_SHA256=$(openssl x509 -in "$CERT_PATH" -noout -fingerprint -sha256 2>/dev/null \
-        | sed 's/.*=//;s/://g' || echo "")
+    update_pin
+}
+
+# 计算并显示 pinSHA256 (证书指纹)
+update_pin() {
+    PIN_SHA256=""
+    if [[ -n "${CERT_PATH:-}" && -f "${CERT_PATH:-}" ]] && command -v openssl &>/dev/null; then
+        PIN_SHA256=$(openssl x509 -in "$CERT_PATH" -noout -fingerprint -sha256 2>/dev/null \
+            | sed 's/.*=//;s/://g' || echo "")
+    fi
     if [[ -n "$PIN_SHA256" ]]; then
         info "pinSHA256: ${PIN_SHA256}"
     fi
+}
+
+# --------------- 证书伪装: 提取并克隆域名证书 ---------------
+# 输入域名 -> 与目标站点建立 TLS 连接提取其真实证书
+# -> 克隆 Subject / 签发者(Issuer) / SAN / 密钥类型 / 有效期
+# -> 用本地密钥签发一张外观一致的证书 (私钥本地生成，客户端仍需 insecure 或 pinSHA256)
+clone_cert_from_domain() {
+    local input="$1"
+    local host port
+    input="${input#*://}"
+    input="${input%%/*}"
+    host="$input"
+    port="443"
+    if [[ "$host" == *:* ]]; then
+        port="${host##*:}"
+        host="${host%:*}"
+    fi
+    if [[ -z "$host" ]]; then
+        err "域名无效: $1"
+        return 1
+    fi
+
+    if ! command -v openssl &>/dev/null; then
+        [[ -z "${PKG:-}" ]] && detect_os
+        install_deps "openssl"
+    fi
+
+    local work
+    work=$(mktemp -d 2>/dev/null || mktemp -d -t hy2cert)
+
+    tip "正在连接 ${host}:${port} 提取证书..."
+    echo | openssl s_client -connect "${host}:${port}" -servername "$host" -showcerts 2>/dev/null \
+        | awk '/-----BEGIN CERTIFICATE-----/{f=1} f{print} /-----END CERTIFICATE-----/{if(f) exit}' \
+        > "$work/remote.crt" || true
+    if ! grep -q -- "-----BEGIN CERTIFICATE-----" "$work/remote.crt" 2>/dev/null; then
+        err "无法获取 ${host} 的证书 (请检查域名 / 网络，可写成 host:port 指定端口)"
+        rm -rf "$work" 2>/dev/null || true
+        return 1
+    fi
+
+    # ---- 解析原证书字段 ----
+    local subject issuer not_before not_after sans keyalg bits curve
+    subject=$(openssl x509 -in "$work/remote.crt" -noout -subject -nameopt compat 2>/dev/null | sed 's/^subject=[[:space:]]*//') || true
+    issuer=$(openssl x509 -in "$work/remote.crt" -noout -issuer -nameopt compat 2>/dev/null | sed 's/^issuer=[[:space:]]*//') || true
+    not_before=$(openssl x509 -in "$work/remote.crt" -noout -startdate 2>/dev/null | sed 's/notBefore=//') || true
+    not_after=$(openssl x509 -in "$work/remote.crt" -noout -enddate 2>/dev/null | sed 's/notAfter=//') || true
+    keyalg=$(openssl x509 -in "$work/remote.crt" -noout -text 2>/dev/null | grep -m1 "Public Key Algorithm" | sed 's/.*: //') || true
+    bits=$(openssl x509 -in "$work/remote.crt" -noout -text 2>/dev/null | sed -n 's/.*Public-Key: (\([0-9][0-9]*\) bit).*/\1/p' | head -1) || true
+    curve=$(openssl x509 -in "$work/remote.crt" -noout -text 2>/dev/null | sed -n 's/.*NIST CURVE: \(P-[0-9][0-9]*\).*/\1/p' | head -1) || true
+
+    # SAN: 优先 -ext (OpenSSL >= 1.1.1)，失败则从 -text 输出按缩进提取
+    sans=$(openssl x509 -in "$work/remote.crt" -noout -ext subjectAltName 2>/dev/null \
+        | awk '!/Subject Alternative Name/{gsub(/[ \t]/,""); printf "%s",$0}') || true
+    if [[ "$sans" != *DNS:* && "$sans" != *IP:* ]]; then
+        sans=$(openssl x509 -in "$work/remote.crt" -noout -text 2>/dev/null \
+            | awk '/X509v3 Subject Alternative Name/{f=1;next} f{n=match($0,/[^ \t]/); if(!n){next} if(!ind){ind=n} if(n<ind){exit} gsub(/[ \t]/,""); printf "%s",$0}') || true
+    fi
+    sans=$(printf '%s' "$sans" | sed 's/IP Address:/IP:/g') || true
+    if [[ "$sans" != *DNS:* && "$sans" != *IP:* ]]; then
+        sans=""
+    fi
+    [[ -z "$sans" ]] && sans="DNS:${host}"
+    case "$sans" in
+        *"DNS:${host}"*|*"IP:${host}"*) ;;
+        *) sans="DNS:${host},${sans}" ;;
+    esac
+
+    # subject 解析失败则回退为 CN=域名
+    if [[ "$subject" != /* ]]; then
+        subject="/CN=${host}"
+    fi
+    local self_signed=0
+    if [[ -z "$issuer" || "$issuer" != /* ]]; then
+        self_signed=1
+        issuer="$subject"
+    fi
+
+    # 有效期: 尽量贴近原证书 (默认 825 天，不超过原证书到期时间)
+    local days=825 now_epoch na_epoch=""
+    now_epoch=$(date +%s 2>/dev/null) || now_epoch=0
+    na_epoch=$(date -d "$not_after" +%s 2>/dev/null) || na_epoch=""
+    if [[ -z "$na_epoch" && -n "$not_after" ]]; then
+        # BusyBox date 兼容: 手动解析 "MMM DD HH:MM:SS YYYY GMT"
+        local mm_name mm dd yy
+        mm_name=$(printf '%s' "$not_after" | awk '{print $1}')
+        dd=$(printf '%s' "$not_after" | awk '{print $2}')
+        yy=$(printf '%s' "$not_after" | awk '{print $4}')
+        case "$mm_name" in
+            Jan) mm=01;; Feb) mm=02;; Mar) mm=03;; Apr) mm=04;; May) mm=05;; Jun) mm=06;;
+            Jul) mm=07;; Aug) mm=08;; Sep) mm=09;; Oct) mm=10;; Nov) mm=11;; Dec) mm=12;;
+            *) mm="" ;;
+        esac
+        if [[ -n "$mm" && "$dd" =~ ^[0-9]+$ && "$yy" =~ ^[0-9]+$ ]]; then
+            na_epoch=$(date -u -d "${yy}-${mm}-${dd} 00:00:00" +%s 2>/dev/null) || na_epoch=""
+        fi
+    fi
+    if [[ -n "$na_epoch" && "$now_epoch" =~ ^[0-9]+$ && "$now_epoch" -gt 0 ]]; then
+        days=$(( (na_epoch - now_epoch) / 86400 ))
+        if (( days < 1 )); then days=1; fi
+        if (( days > 3650 )); then days=3650; fi
+    fi
+
+    # ---- 密钥类型与原证书一致 ----
+    local leaf_key="$work/leaf.key"
+    if [[ "$keyalg" == *ecPublicKey* || "$keyalg" == *"id-ec"* ]]; then
+        local cname="prime256v1"
+        case "$curve" in
+            P-384) cname="secp384r1" ;;
+            P-521) cname="secp521r1" ;;
+        esac
+        openssl ecparam -genkey -name "$cname" -out "$leaf_key" 2>/dev/null \
+            || { err "生成密钥失败"; rm -rf "$work" 2>/dev/null || true; return 1; }
+    else
+        local rbits="${bits:-2048}"
+        [[ "$rbits" =~ ^[0-9]+$ ]] || rbits=2048
+        if (( rbits < 2048 )); then rbits=2048; fi
+        if (( rbits > 4096 )); then rbits=4096; fi
+        openssl genrsa -out "$leaf_key" "$rbits" 2>/dev/null \
+            || { err "生成密钥失败"; rm -rf "$work" 2>/dev/null || true; return 1; }
+    fi
+
+    # ---- 伪造签发者 CA (subject 克隆自原证书 Issuer)，再签发叶子证书 -> Issuer 一致 ----
+    local ca_key="$work/ca.key" ca_crt="$work/ca.crt" mode="clone"
+    if (( self_signed == 0 )); then
+        openssl ecparam -genkey -name prime256v1 -out "$ca_key" 2>/dev/null || mode="self"
+        if [[ "$mode" == "clone" ]]; then
+            openssl req -x509 -new -key "$ca_key" -sha256 -days 3650 -subj "$issuer" -out "$ca_crt" 2>/dev/null || mode="self"
+        fi
+    else
+        mode="self"
+    fi
+
+    local leaf_csr="$work/leaf.csr"
+    openssl req -new -key "$leaf_key" -subj "$subject" -out "$leaf_csr" 2>/dev/null \
+        || { err "生成证书请求失败"; rm -rf "$work" 2>/dev/null || true; return 1; }
+
+    local ext="$work/ext.cnf" ku="digitalSignature"
+    [[ "$keyalg" == *rsa* || "$keyalg" == *RSA* ]] && ku="digitalSignature,keyEncipherment"
+    {
+        echo "[v3_ext]"
+        echo "basicConstraints=CA:FALSE"
+        echo "keyUsage=${ku}"
+        echo "extendedKeyUsage=serverAuth"
+        echo "subjectAltName=${sans}"
+    } > "$ext"
+
+    local leaf_crt="$work/leaf.crt"
+    if [[ "$mode" == "clone" ]]; then
+        openssl x509 -req -in "$leaf_csr" -CA "$ca_crt" -CAkey "$ca_key" -CAcreateserial \
+            -sha256 -days "$days" -extfile "$ext" -extensions v3_ext -out "$leaf_crt" 2>/dev/null || mode="self"
+    fi
+    if [[ "$mode" == "self" ]]; then
+        openssl x509 -req -in "$leaf_csr" -signkey "$leaf_key" -sha256 -days "$days" \
+            -extfile "$ext" -extensions v3_ext -out "$leaf_crt" 2>/dev/null \
+            || { err "证书签发失败"; rm -rf "$work" 2>/dev/null || true; return 1; }
+    fi
+
+    mkdir -p "$HY2_CERT_DIR"
+    local cert_out="${HY2_CERT_DIR}/${host}.crt" key_out="${HY2_CERT_DIR}/${host}.key"
+    cp -f "$leaf_crt" "$cert_out" 2>/dev/null || { err "写入证书失败"; rm -rf "$work" 2>/dev/null || true; return 1; }
+    cp -f "$leaf_key" "$key_out" 2>/dev/null || { err "写入密钥失败"; rm -rf "$work" 2>/dev/null || true; return 1; }
+    chmod 644 "$cert_out" 2>/dev/null || true
+    chmod 600 "$key_out" 2>/dev/null || true
+
+    SNI_DOMAIN="$host"
+    CERT_PATH="$cert_out"
+    KEY_PATH="$key_out"
+    MASQUERADE_URL="https://${host}"
+    CERT_MODE="$mode"
+    update_pin
+
+    echo ""
+    info "已提取 ${host} 的证书并完成伪装克隆"
+    tip "原 Subject: ${subject}"
+    tip "原 Issuer:  ${issuer}"
+    tip "原 SAN:     ${sans}"
+    tip "原有效期:   ${not_before:-?} ~ ${not_after:-?}"
+    if [[ "$mode" == "clone" ]]; then
+        info "克隆模式: Subject / 签发者 / SAN 均与目标站点一致"
+    else
+        warn "克隆模式: 仅 Subject / SAN 一致 (未能克隆签发者)"
+    fi
+    rm -rf "$work" 2>/dev/null || true
+    return 0
+}
+
+# 交互: 输入域名并伪装 (失败时回退为该域名的自签证书)
+setup_clone_cert() {
+    local input=""
+    read -rp "请输入要伪装的目标域名 (如 www.microsoft.com，支持 host:port): " input || input=""
+    input="${input// /}"
+    if [[ -z "$input" ]]; then
+        err "域名不能为空"
+        return 1
+    fi
+    if clone_cert_from_domain "$input"; then
+        return 0
+    fi
+    warn "证书提取失败，改为使用该域名自签证书"
+    local host="$input"
+    host="${host#*://}"
+    host="${host%%/*}"
+    host="${host%:*}"
+    SNI_DOMAIN="$host"
+    CERT_PATH="${HY2_CERT_DIR}/${SNI_DOMAIN}.crt"
+    KEY_PATH="${HY2_CERT_DIR}/${SNI_DOMAIN}.key"
+    CERT_MODE="self"
+    generate_self_signed_cert
+    return 0
 }
 
 # --------------- SNI 域名 / 证书 ---------------
@@ -460,8 +685,9 @@ get_sni_domain() {
     echo "  SNI 证书域名设置"
     echo "  1) 使用自签证书 (自动生成)"
     echo "  2) 使用已有证书 (指定路径)"
+    echo "  3) 证书伪装 (输入域名，提取其真实证书并伪装成该域名)"
     echo "=========================================="
-    read -rp "请输入选项 [1-2，默认1]: " cert_choice || cert_choice=1
+    read -rp "请输入选项 [1-3，默认1]: " cert_choice || cert_choice=1
     cert_choice=${cert_choice:-1}
 
     case "$cert_choice" in
@@ -469,6 +695,7 @@ get_sni_domain() {
             SNI_DOMAIN=$(select_sni_from_list)
             CERT_PATH="${HY2_CERT_DIR}/${SNI_DOMAIN}.crt"
             KEY_PATH="${HY2_CERT_DIR}/${SNI_DOMAIN}.key"
+            CERT_MODE="self"
 
             info "生成自签证书: ${SNI_DOMAIN}"
             generate_self_signed_cert
@@ -476,6 +703,7 @@ get_sni_domain() {
         2)
             read -rp "请输入证书文件路径 (.crt): " CERT_PATH || CERT_PATH=""
             read -rp "请输入密钥文件路径 (.key): " KEY_PATH || KEY_PATH=""
+            CERT_MODE="custom"
 
             if [[ ! -f "$CERT_PATH" ]]; then
                 err "证书文件不存在: $CERT_PATH"
@@ -491,6 +719,16 @@ get_sni_domain() {
 
             info "使用已有证书: ${CERT_PATH}"
             info "证书 CN/SNI: ${SNI_DOMAIN}"
+            ;;
+        3)
+            if ! setup_clone_cert; then
+                warn "未输入域名，使用默认自签证书"
+                SNI_DOMAIN="bing.com"
+                CERT_PATH="${HY2_CERT_DIR}/${SNI_DOMAIN}.crt"
+                KEY_PATH="${HY2_CERT_DIR}/${SNI_DOMAIN}.key"
+                CERT_MODE="self"
+                generate_self_signed_cert
+            fi
             ;;
     esac
 
@@ -586,14 +824,23 @@ _install_hy2_manual() {
 
     bin_url="https://github.com/apernet/hysteria/releases/download/${HY2_TAG}/hysteria-linux-${HY2_ARCH}"
     info "下载 Hysteria2 v${HY2_VER} (${HY2_ARCH})..."
-    tip "URL: ${bin_url}"
 
-    # GitHub releases 需要 -L 跟随重定向
-    if curl -fSL --connect-timeout 15 --max-time 180 -o /usr/local/bin/hysteria "$bin_url" 2>/dev/null; then
-        chmod +x /usr/local/bin/hysteria
-    elif wget --timeout=120 -q -O /usr/local/bin/hysteria "$bin_url" 2>/dev/null; then
-        chmod +x /usr/local/bin/hysteria
-    else
+    # 按顺序尝试: 官方源 -> 国内加速镜像 (GitHub releases 需 -L 跟随重定向)
+    local dl_ok=0 try_url
+    while read -r try_url; do
+        [[ -z "$try_url" ]] && continue
+        tip "URL: ${try_url}"
+        if curl -fSL --connect-timeout 15 --max-time 180 -o /usr/local/bin/hysteria "$try_url" 2>/dev/null; then
+            chmod +x /usr/local/bin/hysteria
+            dl_ok=1
+            break
+        elif wget --timeout=120 -q -O /usr/local/bin/hysteria "$try_url" 2>/dev/null; then
+            chmod +x /usr/local/bin/hysteria
+            dl_ok=1
+            break
+        fi
+    done < <(url_candidates "$bin_url")
+    if (( dl_ok == 0 )); then
         err "下载失败，请检查网络或手动下载:"
         tip "curl -fSL -o /usr/local/bin/hysteria '${bin_url}'"
         exit 1
@@ -665,14 +912,79 @@ EOF
     fi
 }
 
-# --------------- 更新脚本 ---------------
+# --------------- 更新脚本 / 版本更新检查 ---------------
+# 拼接下载地址候选: 官方源 -> 国内加速镜像 (部分网络 GitHub 直连不稳定)
+url_candidates() {
+    local base="$1" m
+    echo "$base"
+    for m in $HY2_MIRRORS; do
+        echo "${m}${base}"
+    done
+}
+
+# 拉取 GitHub 上的远程脚本内容 (输出到 stdout)
+fetch_remote_script() {
+    local try_url
+    while read -r try_url; do
+        [[ -z "$try_url" ]] && continue
+        local content
+        content=$(curl -fsSL --connect-timeout 10 --max-time 40 "$try_url" 2>/dev/null) || continue
+        if [[ -n "$content" ]]; then
+            printf '%s' "$content"
+            return 0
+        fi
+    done < <(url_candidates "$HY2_SCRIPT_URL")
+    return 1
+}
+
+# 查询 Hysteria2 最新版本号 (如 v2.12.2)，失败输出空
+fetch_latest_hy2_ver() {
+    local try_url api_result tag
+    while read -r try_url; do
+        [[ -z "$try_url" ]] && continue
+        api_result=$(curl -fsSL --connect-timeout 10 --max-time 20 "$try_url" 2>/dev/null) || continue
+        if [[ -n "$api_result" ]]; then
+            tag=$(printf '%s' "$api_result" | grep '"tag_name"' | head -1 \
+                | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"//;s/".*//') || true
+            if [[ -n "$tag" ]]; then
+                local ver="${tag#*/}"
+                echo "v${ver#v}"
+                return 0
+            fi
+        fi
+    done < <(url_candidates "https://api.github.com/repos/apernet/hysteria/releases/latest")
+    return 1
+}
+
+# 当前已安装的 Hysteria2 版本 (如 v2.12.2)，失败输出空
+get_local_hy2_ver() {
+    command -v hysteria &>/dev/null || { echo ""; return 1; }
+    local out
+    out=$(hysteria version 2>&1 || hysteria --version 2>&1 || true)
+    printf '%s' "$out" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^\([0-9]\)/v\1/'
+}
+
+# 语义化版本比较: version_gt A B -> A>B 时返回 0
+version_gt() {
+    [[ "$1" == "$2" ]] && return 1
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" ]]
+}
+
 do_update_script() {
     check_root
-    info "正在从 GitHub 更新脚本..."
+    info "正在更新脚本..."
     mkdir -p "$(dirname "$HY2_LOCAL_SCRIPT")"
-    if curl -fsSL --connect-timeout 10 --max-time 60 -o "${HY2_LOCAL_SCRIPT}.tmp" "$HY2_SCRIPT_URL"; then
-        mv -f "${HY2_LOCAL_SCRIPT}.tmp" "$HY2_LOCAL_SCRIPT"
-        chmod +x "$HY2_LOCAL_SCRIPT"
+    local try_url ok=0
+    while read -r try_url; do
+        [[ -z "$try_url" ]] && continue
+        if curl -fsSL --connect-timeout 10 --max-time 60 -o "${HY2_LOCAL_SCRIPT}.tmp" "$try_url"; then
+            mv -f "${HY2_LOCAL_SCRIPT}.tmp" "$HY2_LOCAL_SCRIPT"
+            chmod +x "$HY2_LOCAL_SCRIPT"
+            ok=1
+            break
+        fi
+    done < <(url_candidates "$HY2_SCRIPT_URL")
+    if (( ok == 1 )); then
         # 脚本自身即为最新版时，用自身覆盖缓存副本
         local self="${BASH_SOURCE[0]:-}"
         if [[ -n "$self" && "$self" != "$HY2_LOCAL_SCRIPT" && -f "$self" ]]; then
@@ -685,6 +997,98 @@ do_update_script() {
         err "下载失败，请检查网络"
         return 1
     fi
+}
+
+# 升级 Hysteria2 内核到最新版本
+do_update_hy2() {
+    check_root
+    info "正在升级 Hysteria2 内核..."
+    detect_arch
+    _install_hy2_manual
+    restart_service || true
+    info "Hysteria2 升级完成: $(get_local_hy2_ver)"
+}
+
+# 版本更新检查: 脚本版本 + Hysteria2 内核版本 (支持一键升级)
+check_update() {
+    info "正在检查更新..."
+    echo ""
+    echo "=========================================="
+    echo "  版本更新检查"
+    echo "=========================================="
+
+    local local_sv="${SCRIPT_VERSION:-0}" remote_sv=""
+    local remote_script need_script=0 need_hy2=0
+    remote_script=$(fetch_remote_script) || remote_script=""
+    if [[ -n "$remote_script" ]]; then
+        remote_sv=$(printf '%s\n' "$remote_script" | grep -m1 '^SCRIPT_VERSION=' \
+            | sed "s/^SCRIPT_VERSION=//;s/[\"']//g") || remote_sv=""
+    fi
+
+    echo ""
+    echo "  [脚本]"
+    echo "  本地版本: V${local_sv}"
+    if [[ -z "$remote_sv" ]]; then
+        if [[ -n "$remote_script" ]]; then
+            echo "  远程版本: 未知 (远程脚本暂无版本标记)"
+        else
+            echo "  远程版本: 获取失败 (网络受限，可稍后重试)"
+        fi
+    elif [[ "$remote_sv" == "$local_sv" ]]; then
+        echo "  远程版本: V${remote_sv}  (已是最新)"
+    elif version_gt "$remote_sv" "$local_sv"; then
+        echo "  远程版本: V${remote_sv}  (发现新版本)"
+        need_script=1
+    else
+        echo "  远程版本: V${remote_sv}  (本地版本更高)"
+    fi
+
+    local local_hy="" latest_hy=""
+    local_hy=$(get_local_hy2_ver) || local_hy=""
+    latest_hy=$(fetch_latest_hy2_ver) || latest_hy=""
+
+    echo ""
+    echo "  [Hysteria2 内核]"
+    if [[ -n "$local_hy" ]]; then
+        echo "  当前版本: ${local_hy}"
+    else
+        echo "  当前版本: 未安装"
+    fi
+    if [[ -n "$latest_hy" ]]; then
+        echo "  最新版本: ${latest_hy}"
+        if [[ -z "$local_hy" ]]; then
+            :
+        elif [[ "$local_hy" != "$latest_hy" ]] && version_gt "$latest_hy" "$local_hy"; then
+            echo "  状态:     发现新版本"
+            need_hy2=1
+        else
+            echo "  状态:     已是最新"
+        fi
+    else
+        echo "  最新版本: 获取失败 (网络受限，可稍后重试)"
+    fi
+
+    if (( need_script == 0 && need_hy2 == 0 )); then
+        echo ""
+        info "没有需要更新的内容"
+        return 0
+    fi
+
+    echo ""
+    read -rp "是否现在更新? [y/N]: " yn || yn=""
+    case "${yn:-N}" in
+        y|Y|yes|YES)
+            if (( need_hy2 == 1 )); then
+                do_update_hy2 || warn "Hysteria2 升级失败"
+            fi
+            if (( need_script == 1 )); then
+                do_update_script || warn "脚本更新失败"
+            fi
+            ;;
+        *)
+            info "已取消，可稍后用 hy2 update (脚本) / hy2 upgrade (内核) 单独更新"
+            ;;
+    esac
 }
 
 # --------------- 写配置文件 ---------------
@@ -847,7 +1251,11 @@ generate_link() {
     tip "端口:     ${SERVER_PORT}"
     tip "密码:     ${HY2_PASSWORD}"
     tip "SNI:      ${SNI_DOMAIN}"
-    tip "证书:     自签 (客户端需开启 insecure)"
+    if [[ "${CERT_MODE:-}" == "clone" ]]; then
+        tip "证书:     克隆伪装 (伪装自 ${SNI_DOMAIN}，客户端需开启 insecure)"
+    else
+        tip "证书:     自签 (客户端需开启 insecure)"
+    fi
     if [[ -n "${PIN_SHA256:-}" ]]; then
         tip "pinSHA256: ${PIN_SHA256}"
     fi
@@ -1006,11 +1414,21 @@ do_node_info() {
     if [[ -n "${CERT_PATH:-}" ]]; then
         if [[ -f "$CERT_PATH" ]]; then
             echo "  证书:     ${CERT_PATH}"
-            if [[ "$CERT_PATH" == "${HY2_CERT_DIR}/"* ]]; then
-                echo "  证书类型: 自签 (客户端需设置 insecure: true)"
-            else
-                echo "  证书类型: 自定义证书"
-            fi
+            case "${CERT_MODE:-}" in
+                clone)
+                    echo "  证书类型: 克隆伪装证书 (伪装自 ${SNI_DOMAIN}，客户端需 insecure)"
+                    ;;
+                custom)
+                    echo "  证书类型: 自定义证书"
+                    ;;
+                *)
+                    if [[ "$CERT_PATH" == "${HY2_CERT_DIR}/"* ]]; then
+                        echo "  证书类型: 自签 (客户端需设置 insecure: true)"
+                    else
+                        echo "  证书类型: 自定义证书"
+                    fi
+                    ;;
+            esac
             if command -v openssl &>/dev/null; then
                 local end_date pin
                 end_date=$(openssl x509 -in "$CERT_PATH" -noout -enddate 2>/dev/null | sed 's/notAfter=//' || true)
@@ -1160,10 +1578,11 @@ edit_sni() {
     echo ""
     echo "  1) 使用自签证书 (重新生成)"
     echo "  2) 使用已有证书 (指定路径)"
+    echo "  3) 证书伪装 (输入域名，提取其真实证书并伪装成该域名)"
     echo "  0) 返回"
     echo ""
     local c=""
-    read -rp "请输入 [0-2]: " c || c=0
+    read -rp "请输入 [0-3]: " c || c=0
     case "${c:-0}" in
         1)
             local new_sni
@@ -1171,6 +1590,7 @@ edit_sni() {
             SNI_DOMAIN="$new_sni"
             CERT_PATH="${HY2_CERT_DIR}/${SNI_DOMAIN}.crt"
             KEY_PATH="${HY2_CERT_DIR}/${SNI_DOMAIN}.key"
+            CERT_MODE="self"
             generate_self_signed_cert
             # 伪装站点若原本跟随 SNI，则同步更新
             if [[ -z "${MASQUERADE_URL:-}" || "$MASQUERADE_URL" == "https://${sni_prev}" ]]; then
@@ -1196,6 +1616,7 @@ edit_sni() {
             fi
             CERT_PATH="$new_cert"
             KEY_PATH="$new_key"
+            CERT_MODE="custom"
             local cn
             cn=$(openssl x509 -in "$CERT_PATH" -noout -subject 2>/dev/null \
                 | sed 's/.*CN\s*=\s*//' | sed 's/\/.*//' || echo "")
@@ -1208,6 +1629,21 @@ edit_sni() {
             info "已切换证书: ${CERT_PATH}"
             info "SNI: ${SNI_DOMAIN}"
             warn "自有证书无需客户端 insecure，请按你的证书情况配置客户端"
+            show_links
+            ;;
+        3)
+            if ! setup_clone_cert; then
+                info "已取消"
+                return 0
+            fi
+            # 伪装站点若原本跟随 SNI，则同步更新
+            if [[ -z "${MASQUERADE_URL:-}" || "$MASQUERADE_URL" == "https://${sni_prev}" ]]; then
+                MASQUERADE_URL="https://${SNI_DOMAIN}"
+            fi
+            write_config
+            save_install_info
+            restart_service || true
+            info "证书伪装已生效: SNI ${SNI_DOMAIN}"
             show_links
             ;;
         0|*) info "已取消" ;;
@@ -1352,9 +1788,10 @@ show_menu() {
             echo "  5) 重新安装 / 覆盖安装"
             echo "  6) 卸载 Hysteria2"
             echo "  7) 更新脚本"
+            echo "  8) 检查更新 (脚本 / Hysteria2 内核)"
             echo "  0) 退出"
             echo ""
-            read -rp "请输入 [0-7]: " choice || choice=0
+            read -rp "请输入 [0-8]: " choice || choice=0
 
             case "${choice:-0}" in
                 1) do_node_info ;;
@@ -1364,21 +1801,24 @@ show_menu() {
                 5) do_install ;;
                 6) do_uninstall ;;
                 7) do_update_script || true ;;
+                8) check_update || true ;;
                 0) exit 0 ;;
                 *) err "无效选项" ;;
             esac
         else
             echo "  1) 安装 Hysteria2"
             echo "  7) 更新脚本"
+            echo "  8) 检查更新 (脚本 / Hysteria2 内核)"
             echo "  0) 退出"
             echo ""
             echo "  (未检测到 Hysteria2 安装)"
             echo ""
-            read -rp "请输入 [0-1]: " choice || choice=0
+            read -rp "请输入 [0-8，常用1/8/0]: " choice || choice=0
 
             case "${choice:-0}" in
                 1) do_install ;;
                 7) do_update_script || true ;;
+                8) check_update || true ;;
                 0) exit 0 ;;
                 *) err "无效选项" ;;
             esac
@@ -1404,6 +1844,8 @@ show_help() {
   hy2 restart    / -r     重启服务
   hy2 log        / -l     查看最近 50 行日志
   hy2 update     / -u     更新脚本到最新版本
+  hy2 check      / -c     检查更新 (脚本 / Hysteria2 内核，发现新版本可一键升级)
+  hy2 upgrade            升级 Hysteria2 内核到最新版本
   hy2 uninstall           卸载 Hysteria2
   hy2 help       / -h     显示本帮助
 
@@ -1428,6 +1870,8 @@ case "${1:-}" in
     restart|-r|--restart)   do_restart ;;
     log|-l|--log)           do_log ;;
     update|-u|--update)     do_update_script ;;
+    check|-c|--check)       check_update ;;
+    upgrade|--upgrade)      do_update_hy2 ;;
     help|-h|--help)         show_help ;;
     menu|--menu)
         check_root
