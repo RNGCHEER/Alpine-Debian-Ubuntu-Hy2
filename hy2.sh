@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# Hysteria2 一键安装管理脚本   (版本 V0.3)
+# Hysteria2 一键安装管理脚本   (版本 V0.3.1)
 # 支持: Alpine / Debian / Ubuntu
 # 架构: x86_64 / aarch64 / armv7
 # 功能: 输入IP、选择端口、自签/克隆 SNI 证书、安装/卸载/管理
@@ -22,9 +22,9 @@ HY2_SCRIPT_URL="https://raw.githubusercontent.com/RNGCHEER/Alpine-Debian-Ubuntu-
 HY2_LOCAL_SCRIPT="/usr/local/lib/hy2/hy2.sh"
 HY2_CMD="/usr/local/bin/hy2"
 # 脚本版本号 (版本更新检查时与 GitHub 上的脚本对比)
-SCRIPT_VERSION="0.3"
-# 国内网络兜底: GitHub 加速镜像前缀 (按顺序尝试)
-HY2_MIRRORS="https://gh-proxy.com/ https://ghfast.top/ https://github.moeyy.cn/"
+SCRIPT_VERSION="0.3.1"
+# 国内网络兜底: GitHub 加速镜像前缀 (按顺序尝试，下载后校验完整性，失效镜像自动跳过)
+HY2_MIRRORS="https://gh-proxy.com/ https://ghproxy.net/ https://ghproxy.cn/"
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -781,8 +781,8 @@ install_hy2() {
     # 检查是否已安装
     if command -v hysteria &>/dev/null; then
         local cur_ver
-        cur_ver=$(hysteria version 2>/dev/null | head -1 || echo "未知")
-        warn "已安装 Hysteria2: ${cur_ver}"
+        cur_ver=$(get_local_hy2_ver 2>/dev/null || true)
+        warn "已安装 Hysteria2: ${cur_ver:-未知}"
         read -rp "是否重新安装? [y/N]: " reinstall || reinstall=""
         if [[ "${reinstall,,}" != "y" ]]; then
             return 0
@@ -819,29 +819,25 @@ _install_hy2_manual() {
         if [ -n "$detected_tag" ]; then
             HY2_TAG="$detected_tag"
             HY2_VER="${detected_tag#*/}"
+            HY2_VER="${HY2_VER#v}"
         fi
     fi
 
     bin_url="https://github.com/apernet/hysteria/releases/download/${HY2_TAG}/hysteria-linux-${HY2_ARCH}"
     info "下载 Hysteria2 v${HY2_VER} (${HY2_ARCH})..."
 
-    # 按顺序尝试: 官方源 -> 国内加速镜像 (GitHub releases 需 -L 跟随重定向)
+    # 按顺序尝试: 官方源 -> 国内加速镜像 (下载后校验完整性，坏文件自动换下一个源)
     local dl_ok=0 try_url
     while read -r try_url; do
         [[ -z "$try_url" ]] && continue
         tip "URL: ${try_url}"
-        if curl -fSL --connect-timeout 15 --max-time 180 -o /usr/local/bin/hysteria "$try_url" 2>/dev/null; then
-            chmod +x /usr/local/bin/hysteria
-            dl_ok=1
-            break
-        elif wget --timeout=120 -q -O /usr/local/bin/hysteria "$try_url" 2>/dev/null; then
-            chmod +x /usr/local/bin/hysteria
+        if download_exec "$try_url" /usr/local/bin/hysteria; then
             dl_ok=1
             break
         fi
     done < <(url_candidates "$bin_url")
     if (( dl_ok == 0 )); then
-        err "下载失败，请检查网络或手动下载:"
+        err "下载失败 (已尝试官方源与国内镜像，均不可用)，请检查网络或手动下载:"
         tip "curl -fSL -o /usr/local/bin/hysteria '${bin_url}'"
         exit 1
     fi
@@ -920,6 +916,30 @@ url_candidates() {
     for m in $HY2_MIRRORS; do
         echo "${m}${base}"
     done
+}
+
+# 下载可执行文件并校验完整性 (拒绝镜像返回的 HTML 错误页 / 截断文件)
+# 成功返回 0；失败返回 1 且不留残余文件
+download_exec() {
+    local url="$1" dest="$2" tmp="${2}.dl"
+    rm -f "$tmp" 2>/dev/null || true
+    if ! curl -fSL --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 300 -o "$tmp" "$url" 2>/dev/null; then
+        if ! wget --timeout=120 -q -O "$tmp" "$url" 2>/dev/null; then
+            rm -f "$tmp" 2>/dev/null || true
+            return 1
+        fi
+    fi
+    # 必须是 ELF 可执行文件且体积合理，防止 200 + 错误页被当成安装成功
+    local magic size
+    magic=$(head -c 4 "$tmp" 2>/dev/null || true)
+    size=$(wc -c < "$tmp" 2>/dev/null || echo 0)
+    if [[ "$magic" != $'\x7fELF' ]] || (( size < 1000000 )); then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    mv -f "$tmp" "$dest"
+    chmod +x "$dest"
+    return 0
 }
 
 # 拉取 GitHub 上的远程脚本内容 (输出到 stdout)
@@ -1393,8 +1413,8 @@ do_node_info() {
 
     if command -v hysteria &>/dev/null; then
         local ver
-        ver=$(hysteria version 2>/dev/null | head -1 || echo "未知")
-        echo "  版本:     ${ver}"
+        ver=$(get_local_hy2_ver 2>/dev/null || true)
+        echo "  版本:     ${ver:-未知}"
     else
         echo "  版本:     未安装"
     fi

@@ -31,7 +31,7 @@ hy2
 - **证书伪装 (V0.3 新增)** - 输入域名后自动提取目标站点真实证书，克隆其 Subject / 签发者 / SAN / 有效期，伪装成该域名
 - 支持已有证书路径导入
 - **版本更新检查 (V0.3 新增)** - 一键检查脚本 / Hysteria2 内核版本，发现新版本可在线升级
-- **国内网络优化 (V0.3 新增)** - GitHub 下载自动走国内加速镜像 (gh-proxy / ghfast / moeyy)，多镜像兜底
+- **国内网络优化 (V0.3 新增)** - GitHub 下载自动走国内加速镜像 (gh-proxy / ghproxy 系)，多镜像兜底 + 下载文件完整性校验
 - 输出 pinSHA256
 - 自动生成 hysteria2:// 分享链接
 - 支持 systemd / openrc (进程守护 + 开机自启)
@@ -186,7 +186,7 @@ hy2 help         # 显示帮助
 - **Hysteria2 内核版本**：已装二进制版本与官方最新 Release 对比
 
 发现新版本后询问是否升级，脚本与内核都支持在线一键更新（`hy2 update` / `hy2 upgrade`）。
-所有 GitHub 下载在官方源失败时自动改走国内加速镜像（gh-proxy.com / ghfast.top / github.moeyy.cn），国内 VPS 也能顺畅更新。
+所有 GitHub 下载在官方源失败时自动改走国内加速镜像（gh-proxy.com / ghproxy.net / ghproxy.cn），并**校验下载文件完整性**（拒绝镜像返回的错误页），国内 VPS 也能顺畅更新。
 
 ## ⚠️ 注意
 
@@ -221,6 +221,11 @@ masquerade:
     url: https://bing.com
     rewriteHost: true
 ```
+
+## 📣 版本历史
+
+- **V0.3.1** 修复: 剔除失效下载镜像 (ghfast.top / github.moeyy.cn)，新增下载文件完整性校验 (拒绝 200 + 错误页)，修正版本号重复前缀与版本显示为空
+- **V0.3** 新增: 证书伪装 (提取域名证书并克隆)、脚本 / Hysteria2 版本更新检查、国内镜像加速
 
 ## 📜 License
 
