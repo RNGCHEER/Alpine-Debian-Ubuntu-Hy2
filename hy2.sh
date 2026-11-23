@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# Hysteria2 一键安装管理脚本   (版本 V0.3.1)
+# Hysteria2 一键安装管理脚本   (版本 V0.3.2)
 # 支持: Alpine / Debian / Ubuntu
 # 架构: x86_64 / aarch64 / armv7
 # 功能: 输入IP、选择端口、自签/克隆 SNI 证书、安装/卸载/管理
@@ -22,7 +22,7 @@ HY2_SCRIPT_URL="https://raw.githubusercontent.com/RNGCHEER/Alpine-Debian-Ubuntu-
 HY2_LOCAL_SCRIPT="/usr/local/lib/hy2/hy2.sh"
 HY2_CMD="/usr/local/bin/hy2"
 # 脚本版本号 (版本更新检查时与 GitHub 上的脚本对比)
-SCRIPT_VERSION="0.3.1"
+SCRIPT_VERSION="0.3.2"
 # 国内网络兜底: GitHub 加速镜像前缀 (按顺序尝试，下载后校验完整性，失效镜像自动跳过)
 HY2_MIRRORS="https://gh-proxy.com/ https://ghproxy.net/ https://ghproxy.cn/"
 GREEN='\033[0;32m'
@@ -444,13 +444,16 @@ generate_self_signed_cert() {
         install_deps "openssl"
     fi
 
-    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$KEY_PATH" \
         -out "$CERT_PATH" \
         -subj "/CN=${SNI_DOMAIN}" \
+        -addext "subjectAltName=DNS:${SNI_DOMAIN}" \
+        -addext "basicConstraints=critical,CA:FALSE" \
         -days 36500 2>/dev/null
 
-    chmod -R 777 "$HY2_CERT_DIR"
+    chmod 644 "$CERT_PATH"
+    chmod 600 "$KEY_PATH"
     info "自签证书已生成: ${CERT_PATH}"
     info "自签密钥已生成: ${KEY_PATH}"
 
@@ -472,7 +475,7 @@ update_pin() {
 # --------------- 证书伪装: 提取并克隆域名证书 ---------------
 # 输入域名 -> 与目标站点建立 TLS 连接提取其真实证书
 # -> 克隆 Subject / 签发者(Issuer) / SAN / 密钥类型 / 有效期
-# -> 用本地密钥签发一张外观一致的证书 (私钥本地生成，客户端仍需 insecure 或 pinSHA256)
+# -> 用本地密钥签发证书 (私钥本地生成，客户端需显式信任证书或校验指纹)
 clone_cert_from_domain() {
     local input="$1"
     local host port
@@ -1116,7 +1119,7 @@ write_config() {
     info "写入配置文件..."
     mkdir -p "$(dirname "$HY2_CONFIG")"
 
-    # 根据证书类型决定 SNI 和 insecure 设置
+    # 服务端只配置证书/私钥；证书信任由客户端配置决定。
     cat > "$HY2_CONFIG" <<EOF
 # Hysteria2 配置文件 - 自动生成
 listen: :${SERVER_PORT}
@@ -1124,8 +1127,6 @@ listen: :${SERVER_PORT}
 tls:
   cert: ${CERT_PATH}
   key: ${KEY_PATH}
-  sni: ${SNI_DOMAIN}
-  insecure: true
 
 auth:
   type: password
@@ -1227,35 +1228,115 @@ restart_service() {
     return 0
 }
 
+# JSON 字符串转义，无需 jq / Python。
+json_string() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\t'/\\t}"
+    value="${value//$'\b'/\\b}"
+    value="${value//$'\f'/\\f}"
+    printf '"%s"' "$value"
+}
+
+url_encode() {
+    local LC_ALL=C value="$1" out="" char hex i
+    for ((i=0; i<${#value}; i++)); do
+        char="${value:i:1}"
+        case "$char" in
+            [a-zA-Z0-9.~_-]) out+="$char" ;;
+            *) printf -v hex '%%%02X' "'$char"; out+="$hex" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# 完整证书导入仍校验有效期和 SAN；旧版仅 CN 的证书需要重新生成。
+client_certificate() {
+    if [[ ! -r "${CERT_PATH:-}" ]] || ! command -v openssl &>/dev/null; then
+        err "无法读取证书或未安装 openssl，拒绝生成无验证链接" >&2
+        return 1
+    fi
+    if [[ -z "${SNI_DOMAIN:-}" ]] ||
+       ! openssl x509 -in "$CERT_PATH" -noout -checkend 0 >/dev/null 2>&1 ||
+       ! openssl x509 -in "$CERT_PATH" -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:\|IP Address:' ||
+       ! openssl x509 -in "$CERT_PATH" -noout -checkhost "$SNI_DOMAIN" 2>/dev/null | grep -q 'does match certificate'; then
+        err "证书已过期、缺少 SAN 或与 SNI 不匹配；请在 hy2 edit 中重新生成/更换证书" >&2
+        return 1
+    fi
+    # 只导出公开证书，不读取私钥。
+    openssl x509 -in "$CERT_PATH" -outform PEM
+}
+
+v2rayn_link() {
+    local address="$1" name="$2" pem="$3" payload encoded
+    payload=$(printf '{"ConfigType":7,"ConfigVersion":4,"Remarks":%s,"Address":%s,"Port":%s,"Password":%s,"StreamSecurity":"tls","AllowInsecure":"false","Sni":%s,"Alpn":"h3","Cert":%s}' \
+        "$(json_string "$name")" "$(json_string "$address")" "${SERVER_PORT:-443}" \
+        "$(json_string "${HY2_PASSWORD:-}")" "$(json_string "$SNI_DOMAIN")" "$(json_string "$pem")")
+    encoded=$(printf '%s' "$payload" | base64 | tr -d '\r\n=' | tr '+/' '-_')
+    printf 'v2rayn://hysteria2/%s\n' "$encoded"
+}
+
+# 输出可嵌入配置的单个 outbound，NekoBox 自定义出站使用 sing-box。
+export_client() {
+    local core="${1:-sing-box}" family="${2:-4}" address pem
+    case "$core" in
+        sing-box|xray) ;;
+        *) err "用法: hy2 export [sing-box|xray] [4|6]" >&2; return 1 ;;
+    esac
+    case "$family" in
+        4|6) ;;
+        *) err "IP 版本必须是 4 或 6" >&2; return 1 ;;
+    esac
+    load_install_info >&2
+    if [[ "$family" == 6 ]]; then address="${SERVER_IP6:-}"; else address="${SERVER_IP4:-${SERVER_IP6:-}}"; fi
+    [[ -n "$address" ]] || { err "未配置所选 IP 地址" >&2; return 1; }
+    pem=$(client_certificate) || return 1
+    if [[ "$core" == sing-box ]]; then
+        printf '{"type":"hysteria2","tag":"hy2","server":%s,"server_port":%s,"password":%s,"tls":{"enabled":true,"server_name":%s,"insecure":false,"alpn":["h3"],"certificate":%s}}\n' \
+            "$(json_string "$address")" "$SERVER_PORT" "$(json_string "$HY2_PASSWORD")" \
+            "$(json_string "$SNI_DOMAIN")" "$(json_string "$pem")"
+    else
+        printf '{"protocol":"hysteria","tag":"hy2","settings":{"version":2,"address":%s,"port":%s},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":%s},"tlsSettings":{"serverName":%s,"alpn":["h3"],"disableSystemRoot":true,"certificates":[{"usage":"verify","certificate":%s}]}}}\n' \
+            "$(json_string "$address")" "$SERVER_PORT" "$(json_string "$HY2_PASSWORD")" \
+            "$(json_string "$SNI_DOMAIN")" \
+            "$(awk 'BEGIN{printf "["} {sub(/\r$/, ""); printf "%s\"%s\"", (NR>1 ? "," : ""), $0} END{print "]"}' <<< "$pem")"
+    fi
+}
+
 # --------------- 输出分享链接 ---------------
 show_links() {
-    local port="${SERVER_PORT:-443}"
-    local pwd="${HY2_PASSWORD:-}"
-    local sni="${SNI_DOMAIN:-}"
-    local display_name="${NODE_NAME:-Hysteria2-节点}"
-
-    # 根据 IP 情况决定链接中的节点名称
-    local link_name_v4="$display_name"
-    local link_name_v6="$display_name"
-    if [[ -n "${SERVER_IP4:-}" && -n "${SERVER_IP6:-}" ]]; then
-        link_name_v4="${display_name}-IPv4"
-        link_name_v6="${display_name}-IPv6"
-    fi
-
+    local pem address name family pin
+    pem=$(client_certificate) || return 0
+    pin=$(openssl x509 -in "$CERT_PATH" -noout -fingerprint -sha256 | sed 's/.*=//;s/://g')
     echo ""
-    echo "------------ 分享链接 ------------"
-    if [[ -n "${SERVER_IP4:-}" ]]; then
-        tip "IPv4 链接: hysteria2://${pwd}@${SERVER_IP4}:${port}?sni=${sni}&insecure=1#${link_name_v4}"
-    fi
-    if [[ -n "${SERVER_IP6:-}" ]]; then
-        tip "IPv6 链接: hysteria2://${pwd}@[${SERVER_IP6}]:${port}?sni=${sni}&insecure=1#${link_name_v6}"
-    fi
+    echo "------------ 可信分享链接 ------------"
+    for family in 4 6; do
+        if [[ "$family" == 4 ]]; then address="${SERVER_IP4:-}"; else address="${SERVER_IP6:-}"; fi
+        [[ -n "$address" ]] || continue
+        name="${NODE_NAME:-Hysteria2-节点}"
+        if [[ -n "${SERVER_IP4:-}" && -n "${SERVER_IP6:-}" ]]; then name+="-IPv${family}"; fi
+        tip "IPv${family} v2rayN 专用链接 (内含证书，关闭跳过验证):"
+        v2rayn_link "$address" "$name" "$pem"
+        [[ "$family" == 6 ]] && address="[$address]"
+        tip "IPv${family} Hysteria 原生链接 (需客户端支持 pinSHA256):"
+        printf 'hysteria2://%s@%s:%s?sni=%s&insecure=1&pinSHA256=%s#%s\n' \
+            "$(url_encode "${HY2_PASSWORD:-}")" "$address" "${SERVER_PORT:-443}" \
+            "$(url_encode "$SNI_DOMAIN")" "$pin" "$(url_encode "$name")"
+    done
     if [[ -z "${SERVER_IP4:-}" && -z "${SERVER_IP6:-}" ]]; then
         warn "未获取到 IP 地址，无法生成分享链接"
     fi
-    echo "----------------------------------"
+    tip "NekoBox/sing-box: hy2 export sing-box，复制 JSON 到自定义出站"
+    tip "Xray: hy2 export xray，复制 JSON 到 outbounds 数组"
+    tip "原生链接 insecure=1 仅配合 pinSHA256 使用；不支持指纹的客户端请使用完整证书配置"
+    tip "更换证书后必须重新导入；请通过可信渠道传递链接和配置"
+    echo "--------------------------------------"
     echo ""
 }
+
 
 # --------------- 生成链接 (安装完成提示) ---------------
 generate_link() {
@@ -1272,9 +1353,9 @@ generate_link() {
     tip "密码:     ${HY2_PASSWORD}"
     tip "SNI:      ${SNI_DOMAIN}"
     if [[ "${CERT_MODE:-}" == "clone" ]]; then
-        tip "证书:     克隆伪装 (伪装自 ${SNI_DOMAIN}，客户端需开启 insecure)"
+        tip "证书:     克隆伪装 (伪装自 ${SNI_DOMAIN}，使用下方完整证书链接验证)"
     else
-        tip "证书:     自签 (客户端需开启 insecure)"
+        tip "证书:     自签 (使用下方完整证书链接验证)"
     fi
     if [[ -n "${PIN_SHA256:-}" ]]; then
         tip "pinSHA256: ${PIN_SHA256}"
@@ -1436,14 +1517,14 @@ do_node_info() {
             echo "  证书:     ${CERT_PATH}"
             case "${CERT_MODE:-}" in
                 clone)
-                    echo "  证书类型: 克隆伪装证书 (伪装自 ${SNI_DOMAIN}，客户端需 insecure)"
+                    echo "  证书类型: 克隆伪装证书 (伪装自 ${SNI_DOMAIN}，使用完整证书导入)"
                     ;;
                 custom)
                     echo "  证书类型: 自定义证书"
                     ;;
                 *)
                     if [[ "$CERT_PATH" == "${HY2_CERT_DIR}/"* ]]; then
-                        echo "  证书类型: 自签 (客户端需设置 insecure: true)"
+                        echo "  证书类型: 自签 (使用完整证书导入)"
                     else
                         echo "  证书类型: 自定义证书"
                     fi
@@ -1648,7 +1729,7 @@ edit_sni() {
             restart_service || true
             info "已切换证书: ${CERT_PATH}"
             info "SNI: ${SNI_DOMAIN}"
-            warn "自有证书无需客户端 insecure，请按你的证书情况配置客户端"
+            tip "请使用完整证书链接或导出配置，让客户端验证此证书"
             show_links
             ;;
         3)
@@ -1860,6 +1941,8 @@ show_help() {
   hy2 install    / -i     安装 Hysteria2
   hy2 info       / -n     查看节点信息 (服务状态/节点参数/分享链接)
   hy2 edit       / -e     修改节点配置 (名称/端口/密码/SNI/伪装站点/IP)
+  hy2 export [sing-box|xray] [4|6]
+                          导出含可信证书的单个 outbound JSON
   hy2 status     / -s     查看服务状态与当前配置
   hy2 restart    / -r     重启服务
   hy2 log        / -l     查看最近 50 行日志
@@ -1886,6 +1969,7 @@ case "${1:-}" in
     uninstall|--remove)     do_uninstall ;;
     info|node|-n|--info)    do_node_info ;;
     edit|config|-e|--edit)  do_edit_config ;;
+    export)                check_root; export_client "${2:-sing-box}" "${3:-4}" ;;
     status|-s|--status)     do_status ;;
     restart|-r|--restart)   do_restart ;;
     log|-l|--log)           do_log ;;

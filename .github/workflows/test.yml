@@ -1,0 +1,19 @@
+name: Certificate export tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certificate-export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: bash -n hy2.sh
+      - name: Verify exports and certificate trust
+        run: bash tests/client-export.sh

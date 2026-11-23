@@ -33,7 +33,8 @@ hy2
 - **版本更新检查 (V0.3 新增)** - 一键检查脚本 / Hysteria2 内核版本，发现新版本可在线升级
 - **国内网络优化 (V0.3 新增)** - GitHub 下载自动走国内加速镜像 (gh-proxy / ghproxy 系)，多镜像兜底 + 下载文件完整性校验
 - 输出 pinSHA256
-- 自动生成 hysteria2:// 分享链接
+- 自动生成含完整证书的 v2rayN 专用链接，以及带 pinSHA256 的 Hysteria 原生链接
+- 导出 Xray / sing-box 可信证书出站配置（NekoBox 可使用自定义出站）
 - 支持 systemd / openrc (进程守护 + 开机自启)
 - **安装后输入 `hy2` 即可再次进入管理菜单**（查看节点信息 / 修改节点配置）
 - 查看状态、日志、重启服务
@@ -86,15 +87,16 @@ hy2
   SNI:      www.microsoft.com
   伪装站点: https://www.microsoft.com
   证书:     /etc/ssl/private/www.microsoft.com.crt
-  证书类型: 克隆伪装证书 (伪装自 www.microsoft.com，客户端需 insecure)
+  证书类型: 克隆伪装证书 (伪装自 www.microsoft.com，使用完整证书导入)
   证书有效期: Jan 17 08:55:31 2027 GMT
   pinSHA256: 27788D46332B99EE2EF475A347004F7B13D8BFEB93C40CCFA1D505B068D21308
   配置文件: /etc/hysteria/config.yaml
 ----------------------------------
 
------------- 分享链接 ------------
-[→] IPv4 链接: hysteria2://密码@1.2.3.4:443?sni=www.microsoft.com&insecure=1#香港-01-IPv4
-[→] IPv6 链接: hysteria2://密码@[2001:db8::1]:443?sni=www.microsoft.com&insecure=1#香港-01-IPv6
+------------ 可信分享链接 ------------
+[→] IPv4 v2rayN 专用链接 (内含证书，关闭跳过验证):
+v2rayn://hysteria2/（脚本生成的 Base64URL 配置）
+[→] NekoBox/sing-box: hy2 export sing-box，复制 JSON 到自定义出站
 ----------------------------------
 ```
 
@@ -173,9 +175,9 @@ hy2 help         # 显示帮助
 2. **克隆证书的 Subject / 签发者(Issuer) / SAN / 密钥类型 / 有效期**，在本地签发一张外观一致的证书
 3. 自动把 SNI 与伪装站点设为该域名
 
-效果：探针看到的证书信息与目标站点几乎完全一致，不再是一眼假的自签证书。
+克隆只改变证书的展示字段，无法复制原站私钥和 CA 签名，不能保证探针无法识别。
 
-> ⚠️ 私钥无法从目标站点提取（也无法被提取），证书由本地密钥签发，因此客户端仍需 `insecure: true` 或 `pinSHA256` 校验。
+> ⚠️ 私钥无法从目标站点提取（也无法被提取），证书由本地密钥签发，因此不能获得公有 CA 信任；应使用本脚本导出的完整证书配置，或在原生 Hysteria 客户端中使用 `insecure=true` 配合 `pinSHA256` 校验。
 > 提取失败时自动回退为该域名的自签证书。
 
 ## 🔍 版本更新检查（V0.3 新增）
@@ -191,7 +193,7 @@ hy2 help         # 显示帮助
 ## ⚠️ 注意
 
 - Hysteria2 使用 **UDP** 端口，请确保防火墙放行；改端口后记得同步放行新端口
-- 自签证书需要客户端设置 `insecure: true`
+- 自签或克隆证书使用完整证书导入，可关闭跳过验证；原生 Hysteria 链接使用 `insecure=1` 配合 `pinSHA256` 固定证书
 - VPS 内存低于 128M 建议在客户端设置合适带宽
 - 服务管理信息保存在 `/etc/hysteria/.install_info`（权限 600，含密码）
 - 修改配置后客户端需要重新导入新链接（端口 / 密码 / SNI 变化时）
@@ -208,8 +210,6 @@ listen: :443
 tls:
   cert: /etc/ssl/private/bing.com.crt
   key: /etc/ssl/private/bing.com.key
-  sni: bing.com
-  insecure: true
 
 auth:
   type: password
@@ -222,8 +222,53 @@ masquerade:
     rewriteHost: true
 ```
 
+## v2rayN / NekoBox 的证书验证（V0.3.2）
+
+参考 [ArgoX](https://github.com/fscarmen/ArgoX/blob/main/argox.sh) 的完整证书分发方式：将本机服务器的公开证书随节点配置一起导入，而非关闭验证。自签和克隆证书不会因此成为公有 CA 证书，也不需要把它们安装为操作系统的全局根证书。
+
+### v2rayN（Xray 或 sing-box）
+
+1. 更新脚本后运行 `hy2 info`。
+2. 复制完整的 `v2rayn://hysteria2/...` 链接，从剪贴板导入支持此格式的新版 v2rayN。
+3. 检查节点的完整证书字段已有 PEM，跳过证书验证为 `false`，SNI 与证书 SAN 匹配。
+
+配置包含 `ConfigType=7`、`ConfigVersion=4`、`Cert` 和 `AllowInsecure=false`。v2rayN 为 Xray 生成 `certificates[].usage=verify`，为 sing-box 生成 `tls.certificate`。证书、密码和名称均按 JSON 转义，IPv4/IPv6 分别生成节点。
+
+### NekoBox / sing-box
+
+不同 NekoBox 分支、版本对链接里的指纹或证书参数支持不同，不保证一条通用 URI 能保留这些字段。推荐运行：
+
+```bash
+hy2 export sing-box        # 单个 sing-box outbound JSON，优先 IPv4，无 IPv4 时使用 IPv6
+hy2 export sing-box 6      # 指定 IPv6
+hy2 export xray            # 单个 Xray outbound JSON
+```
+
+在提供“自定义出站”的 NekoBox 中粘贴对应内核的 JSON。若版本只支持完整配置，应把这段 JSON 放入现有配置的 `outbounds` 数组并按其界面配置路由；它不是包含入站、DNS 和路由的完整客户端配置。若界面提供 CA/证书字段，也可把服务器证书 PEM 填入该字段，SNI 保持一致，关闭跳过验证。没有相应功能的版本需要使用支持完整证书配置的客户端。
+
+### 已安装节点与证书更新
+
+- V0.3.1 默认自签证书只有 CN，无法通过现代 Go TLS 的域名验证。脚本会拒绝导出，并提示 `hy2 edit` → `4) 修改 SNI / 证书` → 重新生成，之后重新导入客户端。此操作会更换证书并重启服务。
+- 新生成的自签证书带 SAN，私钥权限为 600，不再递归修改整个 `/etc/ssl/private` 的权限。
+- 克隆证书仍使用本机签发的证书；客户端显式信任的是本机证书。已有克隆证书只要有效且 SAN 匹配即可导出。
+- 每次导出均读取当前证书。更换或续签证书后，重新导入链接或 JSON。
+- 原生 Hysteria 链接的 `pinSHA256` 是**整张叶证书 DER 的 SHA-256 十六进制摘要**，不是 sing-box 的 Base64 公钥摘要。`insecure=1` 配合指纹使用；不识别指纹的客户端会失去验证，请使用上面的完整证书方案。
+- 通过可信渠道传递链接、证书和 JSON；其中包含节点密码。导出不会读取或传递私钥。
+
+实现依据：[v2rayN 配置生成代码](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Services/CoreConfig/V2ray/V2rayOutboundService.cs)、[Xray TLS 文档](https://xtls.github.io/en/config/transports/tls.html)、[sing-box TLS 文档](https://sing-box.sagernet.org/configuration/shared/tls/)。
+
+### 开发验证
+
+```bash
+bash -n hy2.sh
+bash tests/client-export.sh
+```
+
+测试需要 OpenSSL、Python 3、Go，所有测试证书都在临时目录生成，不安装服务。覆盖双栈链接、中文及特殊字符、导入证书内容、缺失证书、旧版 CN-only 证书和错误 SNI。Go x509 验证会确认指定证书可被信任，并拒绝替换证书和错误域名。测试未代替具体版本客户端的实际 QUIC 联机验证。
+
 ## 📣 版本历史
 
+- **V0.3.2** 新增完整证书 v2rayN 导入与 Xray/sing-box 出站导出；自签证书增加 SAN；修正证书权限和服务端 TLS 字段
 - **V0.3.1** 修复: 剔除失效下载镜像 (ghfast.top / github.moeyy.cn)，新增下载文件完整性校验 (拒绝 200 + 错误页)，修正版本号重复前缀与版本显示为空
 - **V0.3** 新增: 证书伪装 (提取域名证书并克隆)、脚本 / Hysteria2 版本更新检查、国内镜像加速
 
